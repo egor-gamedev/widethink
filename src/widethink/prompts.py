@@ -18,7 +18,7 @@ from widethink.config import ReinstatementConfig
 from widethink.context import Context, ContextItem, render_item
 from widethink.tree import ThoughtNode
 
-PROMPTS_VERSION = "2026-09-30.2"
+PROMPTS_VERSION = "2026-10-01.1"
 
 EXPANSION_RULES = """\
 You are one step of a "wide thinking" process driven by a harness. The harness \
@@ -76,10 +76,12 @@ why, citing the ids of the findings.
 - Put open questions whose answers would change the solution into questions, saying \
 why they matter; where the solution depends on an answer, state the default you chose \
 meanwhile.
+- Deviations may rest only on EVIDENCED FINDINGS. UNVERIFIED HYPOTHESES are not facts \
+about the user: never state them as facts and never deviate because of them; if one \
+would change the solution, ask about it instead.
+- Having no evidenced findings is a normal outcome: then the standard solution is the \
+right answer - give it without deviations.
 - Do not invent requirements the findings do not support.
-- Findings marked "unknown" or "unresolved" are hypotheses, not facts about the \
-user. Never state them as facts and never base a deviation on them alone; if they \
-matter, turn them into questions.
 - Write in the language of the task."""
 
 
@@ -193,14 +195,18 @@ def synthesis_user(
         standard = f"Approach: {approach}\nKey decisions:\n" + "\n".join(
             f"- {decision}" for decision in decisions
         )
-    finding_lines = [_finding(node) for node in findings] or ["(no findings)"]
+    evidenced = [_finding(node) for node in findings if is_evidenced(node)]
+    hypotheses = [_finding(node) for node in findings if not is_evidenced(node)]
     question_lines = [f"- [{node.id}] {node.question}" for node in questions] or ["(none)"]
     context = render_context(relevant, cfg.item_chars) if relevant else "(none)"
     return "\n\n".join(
         [
             f"TASK:\n{task}",
             f"STANDARD SOLUTION (what a typical model answers):\n{standard}",
-            "FINDINGS OF THE THINKING PROCESS:\n" + "\n".join(finding_lines),
+            "EVIDENCED FINDINGS (the user's context supports or contradicts them, with quotes):\n"
+            + ("\n".join(evidenced) or "(none - keep the standard solution)"),
+            "UNVERIFIED HYPOTHESES (questions at most, never grounds for a deviation):\n"
+            + ("\n".join(hypotheses) or "(none)"),
             "OPEN QUESTIONS RAISED:\n" + "\n".join(question_lines),
             f"RELEVANT CONTEXT:\n{context}",
             "Write the final answer.",
@@ -212,10 +218,13 @@ def render_context(items: Sequence[ContextItem], max_chars: int) -> str:
     return "\n\n".join(render_item(item, max_chars) for item in items)
 
 
+def is_evidenced(node: ThoughtNode) -> bool:
+    """Whether a thought may justify a deviation: the context settles it, with a quote."""
+    return node.resolution in ("supported", "contradicted") and bool(node.evidence)
+
+
 def _finding(node: ThoughtNode) -> str:
     facts: list[str] = [node.kind, node.resolution or "unresolved"]
-    if node.resolution in (None, "unknown"):
-        facts.append("HYPOTHESIS")
     if node.value is not None:
         facts.append(f"value {node.value:+.1f}")
     if node.surprise:

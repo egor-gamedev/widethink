@@ -11,7 +11,7 @@ Methodology, scoring and the authoring checklist:
 
 ## Status
 
-Version 0 — five exemplar tasks that fix the format; not for reporting results.
+Version 0 — nine exemplar tasks (four of them `hard-*`/`control-hard-*`: requirements combine several files) that fix the format; not for reporting results.
 Version 1 (60–100 reviewed tasks with a validated judge) is Phase 2 of the
 [roadmap](../ROADMAP.md).
 
@@ -22,6 +22,10 @@ Version 1 (60–100 reviewed tasks with a validated judge) is Phase 2 of the
 | `soft-delete-gdpr` | data/privacy | erasure requests; unique email blocks re-registration |
 | `webhook-retries-payments` | backend/reliability | 5-second webhook deadline; duplicate deliveries |
 | `control-rate-limit-public-api` | backend/api | none (control) |
+| `hard-daily-orders-export` | data/pipelines | Kyiv business day vs UTC; volume vs worker memory; no personal data to the accounting firm |
+| `hard-shipping-sms` | backend/messaging | quiet hours in local time; verified numbers only; shared gateway rate limit |
+| `hard-catalog-search` | backend/search | regional visibility; Russian/Kazakh text; one small server |
+| `control-hard-healthcheck` | backend/ops | none (control full of irrelevant constraints) |
 
 ## Datasheet (short form)
 

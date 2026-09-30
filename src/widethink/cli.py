@@ -21,6 +21,7 @@ import sys
 import textwrap
 from collections.abc import Sequence
 from pathlib import Path
+from typing import TYPE_CHECKING
 
 from widethink.__about__ import __version__
 from widethink.budget import Budget, Pricing
@@ -31,6 +32,9 @@ from widethink.errors import WideThinkError
 from widethink.events import Event
 from widethink.llm.base import LLM
 from widethink.result import ThinkResult
+
+if TYPE_CHECKING:
+    from widethink.bench.task import BenchTask
 
 SOLVERS = ("direct", "direct-high", "broad", "best-of-n", "widethink")
 PROVIDERS = ("anthropic", "openai", "deepseek")
@@ -137,6 +141,13 @@ def build_parser() -> argparse.ArgumentParser:
 
     run = bench_commands.add_parser("run", help="run solvers at an equal budget and grade them")
     run.add_argument("--tasks", type=Path, default=Path("benchmark/tasks"))
+    run.add_argument(
+        "--only",
+        action="append",
+        default=[],
+        metavar="TEXT",
+        help="run only tasks whose id contains TEXT (repeatable)",
+    )
     run.add_argument("--solver", action="append", choices=SOLVERS, required=True)
     _provider_arguments(run)
     run.add_argument("--judge-provider", choices=PROVIDERS, required=True)
@@ -276,7 +287,7 @@ def cmd_bench_run(args: argparse.Namespace) -> int:
 
     records = asyncio.run(
         run_benchmark(
-            load_tasks(args.tasks),
+            _select(load_tasks(args.tasks), args.only),
             solvers,
             judge=judge,
             budget=Budget(max_tokens=args.budget),
@@ -289,6 +300,13 @@ def cmd_bench_run(args: argparse.Namespace) -> int:
     )
     print(to_markdown(summarize(records, pricing=_pricing(args))))
     return 0
+
+
+def _select(tasks: list[BenchTask], only: list[str]) -> list[BenchTask]:
+    chosen = [t for t in tasks if not only or any(part in t.id for part in only)]
+    if not chosen:
+        raise ValueError(f"no task id contains any of {only}")
+    return chosen
 
 
 def cmd_bench_report(args: argparse.Namespace) -> int:

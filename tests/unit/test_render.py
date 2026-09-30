@@ -61,3 +61,29 @@ def test_mermaid_render() -> None:
     assert "class n5 pruned;" in chart
     assert "class n6 unexplored;" in chart
     assert "class n4 surprise;" in chart
+
+
+def test_synthesis_separates_evidence_from_hypotheses() -> None:
+    from widethink.config import ReinstatementConfig
+    from widethink.prompts import is_evidenced, synthesis_user
+    from widethink.tree import Evidence
+
+    tree = ThoughtTree("task")
+    proven = tree.add("n0", kind="context", origin="proposal", label="Offline for days")
+    proven.resolution, proven.evidence = "supported", [Evidence(source="README", quote="days")]
+    guess = tree.add("n0", kind="context", origin="proposal", label="Email may be shared")
+    guess.resolution = "unknown"
+    assert is_evidenced(proven)
+    assert not is_evidenced(guess)
+    prompt = synthesis_user(
+        task="t", approach=None, decisions=[], findings=[proven, guess], questions=[],
+        relevant=[], cfg=ReinstatementConfig(),
+    )  # fmt: skip
+    evidenced, hypotheses = prompt.split("UNVERIFIED HYPOTHESES")
+    assert "Offline for days" in evidenced
+    assert "Email may be shared" in hypotheses
+    empty = synthesis_user(
+        task="t", approach=None, decisions=[], findings=[guess], questions=[], relevant=[],
+        cfg=ReinstatementConfig(),
+    )  # fmt: skip
+    assert "(none - keep the standard solution)" in empty
