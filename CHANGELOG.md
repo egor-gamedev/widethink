@@ -28,6 +28,22 @@ break the API).
 - Hidden Requirements benchmark: task schema with controls and canary, five
   exemplar tasks, solvers (direct, reasoning effort, broad prompt, best-of-N,
   widethink), LLM judge, resumable runner, report with bootstrap intervals.
-- `widethink` command line: `think`, `render`, `bench validate|run|report`.
+- `widethink` command line: `think`, `render`, `bench validate|run|report|show`.
 - Documentation: architecture, mechanisms, benchmark methodology, related work,
   architecture decision records, roadmap.
+- DeepSeek provider (`DeepSeekLLM`, `--provider deepseek`): `deepseek-flash` by
+  default, thinking mode off for harness steps and on for the reasoning baseline,
+  JSON mode with the schema and a generated example in the prompt.
+- Retries of transient provider failures (`TransientLLMError`); `content_filter`
+  finishes are refusals; cache hits reported by DeepSeek are counted.
+- `bench run --save-trees` keeps the full result of every widethink run;
+  `bench show` prints verdicts and answers per task; `--price-*` options add cost
+  to `think`, `bench run` and `bench report`.
+- The command line loads keys from a `.env` file in the current directory.
+- Guide to testing on real models: `docs/experiments.md`.
+
+### Changed
+
+- Baseline solvers answer in plain text instead of JSON.
+- The benchmark runner records any failure of a job instead of stopping, and
+  failed jobs are run again when a run is resumed.

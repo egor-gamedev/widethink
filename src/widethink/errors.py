@@ -42,5 +42,9 @@ class StructuredOutputError(LLMError):
     """The output could not be parsed or validated against the expected schema."""
 
 
+class TransientLLMError(LLMError):
+    """The provider could not finish the output this time (overload, abort); safe to retry."""
+
+
 class ReplayMismatchError(WideThinkError):
     """A replayed run issued a request that is not present in the recording."""

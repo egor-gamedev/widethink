@@ -6,14 +6,16 @@ without any optional dependency installed.
 
 from widethink.llm.anthropic import AnthropicLLM
 from widethink.llm.base import LLM, LLMRequest, LLMResponse, Message, Usage
+from widethink.llm.deepseek import DeepSeekLLM
 from widethink.llm.openai import OpenAICompatibleLLM
 from widethink.llm.recording import RecordingLLM, ReplayLLM, request_key
 from widethink.llm.scripted import ScriptedLLM, estimate_tokens
-from widethink.llm.structured import generate_structured
+from widethink.llm.structured import generate_structured, generate_text
 
 __all__ = [
     "LLM",
     "AnthropicLLM",
+    "DeepSeekLLM",
     "LLMRequest",
     "LLMResponse",
     "Message",
@@ -24,5 +26,6 @@ __all__ = [
     "Usage",
     "estimate_tokens",
     "generate_structured",
+    "generate_text",
     "request_key",
 ]

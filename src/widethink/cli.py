@@ -1,11 +1,13 @@
 """Command-line interface.
 
     widethink think "Add JWT auth to our API" -c ./my-project --budget 60000
+    widethink think "..." -c ./my-project --provider deepseek --budget 60000
     widethink render result.json --format mermaid
     widethink bench validate --tasks benchmark/tasks
     widethink bench run --tasks benchmark/tasks --solver direct --solver widethink \\
-        --budget 60000 --judge-provider openai --judge-model <model> --out results.jsonl
+        --provider deepseek --judge-provider deepseek --budget 60000 --out results.jsonl
     widethink bench report results.jsonl
+    widethink bench show results.jsonl --task auth-offline-field-app --answers
 """
 
 from __future__ import annotations
@@ -14,12 +16,14 @@ import argparse
 import asyncio
 import contextlib
 import json
+import os
 import sys
+import textwrap
 from collections.abc import Sequence
 from pathlib import Path
 
 from widethink.__about__ import __version__
-from widethink.budget import Budget
+from widethink.budget import Budget, Pricing
 from widethink.config import ABLATIONS, ThinkConfig
 from widethink.context import Context, ContextItem
 from widethink.embeddings.base import Embedder
@@ -29,6 +33,9 @@ from widethink.llm.base import LLM
 from widethink.result import ThinkResult
 
 SOLVERS = ("direct", "direct-high", "broad", "best-of-n", "widethink")
+PROVIDERS = ("anthropic", "openai", "deepseek")
+#: A judge should be at least as strong as the solvers it grades.
+JUDGE_DEFAULTS = {"deepseek": "deepseek-v4-pro"}
 _MARKS = {
     "baseline": "≡",
     "selected": "→",
@@ -43,6 +50,7 @@ _MARKS = {
 def main(argv: Sequence[str] | None = None) -> int:
     """Entry point of the ``widethink`` command."""
     _utf8_console()
+    load_dotenv(Path(".env"))
     args = build_parser().parse_args(argv)
     try:
         code: int = args.handler(args)
@@ -111,6 +119,7 @@ def build_parser() -> argparse.ArgumentParser:
         help="answer model calls from a recording instead of the API",
     )
     think.add_argument("-q", "--quiet", action="store_true", help="no live progress")
+    _pricing_arguments(think)
     think.set_defaults(handler=cmd_think)
 
     render = commands.add_parser("render", help="print the thought tree of a saved result")
@@ -130,8 +139,8 @@ def build_parser() -> argparse.ArgumentParser:
     run.add_argument("--tasks", type=Path, default=Path("benchmark/tasks"))
     run.add_argument("--solver", action="append", choices=SOLVERS, required=True)
     _provider_arguments(run)
-    run.add_argument("--judge-provider", choices=("anthropic", "openai"), required=True)
-    run.add_argument("--judge-model")
+    run.add_argument("--judge-provider", choices=PROVIDERS, required=True)
+    run.add_argument("--judge-model", help="default for deepseek: deepseek-v4-pro")
     run.add_argument("--judge-base-url")
     run.add_argument("--budget", type=int, required=True, metavar="TOKENS")
     run.add_argument("--repeats", type=int, default=1)
@@ -144,12 +153,27 @@ def build_parser() -> argparse.ArgumentParser:
         metavar="FILE",
         help="JSONL file; an interrupted run resumes from it",
     )
+    run.add_argument(
+        "--save-trees",
+        type=Path,
+        metavar="DIR",
+        help="save the full result (thought tree) of every widethink run here",
+    )
+    _pricing_arguments(run)
     run.set_defaults(handler=cmd_bench_run)
 
     report = bench_commands.add_parser("report", help="summarize graded runs")
     report.add_argument("results", type=Path)
     report.add_argument("--format", choices=("markdown", "json"), default="markdown")
+    _pricing_arguments(report)
     report.set_defaults(handler=cmd_bench_report)
+
+    show = bench_commands.add_parser("show", help="verdicts (and answers) of graded runs")
+    show.add_argument("results", type=Path)
+    show.add_argument("--task", help="only this task id")
+    show.add_argument("--solver", help="only this solver")
+    show.add_argument("--answers", action="store_true", help="print the answers too")
+    show.set_defaults(handler=cmd_bench_show)
     return parser
 
 
@@ -173,7 +197,9 @@ def cmd_think(args: argparse.Namespace) -> int:
     if args.replay is not None:
         llm = ReplayLLM(args.replay)
     else:
-        llm = make_llm(args.provider, args.model, args.base_url, args.structured)
+        llm = make_llm(
+            args.provider, args.model, args.base_url, args.structured, reasoning=args.thinking
+        )
         if args.record is not None:
             llm = RecordingLLM(llm, args.record)
     config = ThinkConfig(max_thoughts=args.max_thoughts, parallel=args.parallel)
@@ -183,7 +209,9 @@ def cmd_think(args: argparse.Namespace) -> int:
         config=config.without(*args.without),
         hooks=[] if args.quiet else [_progress],
     )
-    result = thinker.think(args.task, context, budget=args.budget, seed=args.seed)
+    result = thinker.think(
+        args.task, context, budget=args.budget, seed=args.seed, pricing=_pricing(args)
+    )
     if args.out is not None:
         result.save(args.out)
     print(describe(result, tree=args.tree))
@@ -225,16 +253,22 @@ def cmd_bench_run(args: argparse.Namespace) -> int:
         to_markdown,
     )
 
+    wanted = list(dict.fromkeys(args.solver))
     llm = make_llm(args.provider, args.model, args.base_url, args.structured)
-    judge = LLMJudge(make_llm(args.judge_provider, args.judge_model, args.judge_base_url, None))
+    judge_model = args.judge_model or JUDGE_DEFAULTS.get(args.judge_provider)
+    judge = LLMJudge(make_llm(args.judge_provider, judge_model, args.judge_base_url, None))
     builders: dict[str, Solver] = {
         "direct": DirectSolver(llm),
-        "direct-high": DirectSolver(llm, effort="high"),
         "broad": BroadPromptSolver(llm),
         "best-of-n": BestOfNSolver(llm),
-        "widethink": WideThinkSolver(llm),
+        "widethink": WideThinkSolver(llm, save_dir=args.save_trees),
     }
-    solvers = [builders[name] for name in dict.fromkeys(args.solver)]
+    if "direct-high" in wanted:  # reasoning mode needs its own (thinking) model client
+        reasoning = make_llm(
+            args.provider, args.model, args.base_url, args.structured, reasoning=True
+        )
+        builders["direct-high"] = DirectSolver(reasoning, effort="high")
+    solvers = [builders[name] for name in wanted]
 
     def progress(record: RunRecord) -> None:
         status = "error: " + record.error if record.error else "ok"
@@ -253,14 +287,14 @@ def cmd_bench_run(args: argparse.Namespace) -> int:
             on_record=progress,
         )
     )
-    print(to_markdown(summarize(records)))
+    print(to_markdown(summarize(records, pricing=_pricing(args))))
     return 0
 
 
 def cmd_bench_report(args: argparse.Namespace) -> int:
     from widethink.bench import load_records, summarize, to_markdown
 
-    summaries = summarize(load_records(args.results))
+    summaries = summarize(load_records(args.results), pricing=_pricing(args))
     if args.format == "json":
         print(json.dumps([s.model_dump() for s in summaries], indent=2))
     else:
@@ -268,15 +302,71 @@ def cmd_bench_report(args: argparse.Namespace) -> int:
     return 0
 
 
+def cmd_bench_show(args: argparse.Namespace) -> int:
+    from widethink.bench import load_records
+
+    records = [
+        r
+        for r in load_records(args.results)
+        if (args.task is None or r.task_id == args.task)
+        and (args.solver is None or r.solver == args.solver)
+    ]
+    if not records:
+        print("no matching records")
+        return 1
+    for record in records:
+        tokens = record.usage.total.total_tokens if record.usage else 0
+        kind = " (control)" if record.control else ""
+        print(f"=== {record.task_id}{kind} / {record.solver} #{record.repeat} · {tokens:,} tokens")
+        if record.error:
+            print(f"  error: {record.error}")
+        if record.judged is not None:
+            verdict = record.judged.result
+            for v in verdict.verdicts:
+                marks = "".join(
+                    mark if flag else "."
+                    for mark, flag in (("N", v.noticed), ("A", v.addressed), ("Q", v.asked))
+                )
+                print(f"  [{marks}] {v.requirement_id}: {v.rationale}")
+            for claim in verdict.unsupported_claims:
+                print(f"  [invented] {claim}")
+            if record.control:
+                print(f"  kept standard: {'yes' if verdict.kept_standard else 'no'}")
+        if "tree" in record.extra:
+            print(f"  tree: widethink render {record.extra['tree']}")
+        if args.answers and record.answer:
+            print(textwrap.indent(record.answer.strip(), "  | "))
+        print()
+    print("N = noticed, A = addressed, Q = asked the user")
+    return 0
+
+
 # --------------------------------------------------------------------------- helpers
 
 
-def make_llm(provider: str, model: str | None, base_url: str | None, structured: str | None) -> LLM:
-    """Build a provider from command-line options."""
+def make_llm(
+    provider: str,
+    model: str | None,
+    base_url: str | None,
+    structured: str | None,
+    *,
+    reasoning: bool = False,
+) -> LLM:
+    """Build a provider from command-line options.
+
+    ``reasoning`` asks for the provider's reasoning mode: DeepSeek's thinking
+    mode, OpenAI's ``reasoning_effort``; Claude takes the effort natively.
+    """
     if provider == "anthropic":
         from widethink.llm.anthropic import DEFAULT_MODEL, AnthropicLLM
 
         return AnthropicLLM(model or DEFAULT_MODEL)
+    if provider == "deepseek":
+        from widethink.llm.deepseek import DEEPSEEK_BASE_URL, DEFAULT_MODEL, DeepSeekLLM
+
+        return DeepSeekLLM(
+            model or DEFAULT_MODEL, thinking=reasoning, base_url=base_url or DEEPSEEK_BASE_URL
+        )
     if provider == "openai":
         from widethink.llm.openai import OpenAICompatibleLLM
 
@@ -286,6 +376,7 @@ def make_llm(provider: str, model: str | None, base_url: str | None, structured:
             model,
             base_url=base_url,
             structured=structured or "json_schema",  # type: ignore[arg-type]
+            send_effort=reasoning,
         )
     raise ValueError(f"unknown provider {provider!r}")
 
@@ -331,20 +422,24 @@ def describe(result: ThinkResult, *, tree: str = "text") -> str:
         )
     usage = result.usage
     total = usage.total
+    cost = "" if usage.cost_usd is None else f"; cost ${usage.cost_usd:.4f}"
     sections.append(
         "=== Usage ===\n"
         f"{usage.calls} calls ({usage.failed_calls} failed), {total.total_tokens:,} tokens "
         f"(input {total.input_tokens:,}, of them cached {total.cache_read_tokens:,}; "
-        f"output {total.output_tokens:,}); {result.stats.get('thoughts', 0)} thoughts; "
-        f"stopped: {result.meta.stop_reason}; seed {result.meta.seed}"
+        f"output {total.output_tokens:,}){cost}; {result.stats.get('thoughts', 0)} thoughts; "
+        f"stopped: {result.meta.stop_reason}; seed {result.meta.seed}; model {result.meta.llm}"
     )
     sections.extend(f"warning: {warning}" for warning in result.warnings)
     return "\n\n".join(sections)
 
 
 def _provider_arguments(parser: argparse.ArgumentParser) -> None:
-    parser.add_argument("--provider", choices=("anthropic", "openai"), default="anthropic")
-    parser.add_argument("--model", help="model id (default for anthropic: claude-opus-5)")
+    parser.add_argument("--provider", choices=PROVIDERS, default="anthropic")
+    parser.add_argument(
+        "--model",
+        help="model id (defaults: anthropic claude-opus-5, deepseek deepseek-flash)",
+    )
     parser.add_argument(
         "--base-url", help="OpenAI-compatible server, e.g. http://localhost:8000/v1"
     )
@@ -352,6 +447,26 @@ def _provider_arguments(parser: argparse.ArgumentParser) -> None:
         "--structured",
         choices=("json_schema", "json_object", "prompt"),
         help="structured-output mode for OpenAI-compatible servers",
+    )
+    parser.add_argument(
+        "--thinking",
+        action="store_true",
+        help="use the provider's reasoning mode for every call (DeepSeek thinking mode)",
+    )
+
+
+def _pricing_arguments(parser: argparse.ArgumentParser) -> None:
+    group = parser.add_argument_group("cost report (USD per million tokens)")
+    group.add_argument("--price-input", type=float, metavar="USD")
+    group.add_argument("--price-output", type=float, metavar="USD")
+    group.add_argument("--price-cache-read", type=float, metavar="USD")
+
+
+def _pricing(args: argparse.Namespace) -> Pricing | None:
+    if args.price_input is None or args.price_output is None:
+        return None
+    return Pricing(
+        input=args.price_input, output=args.price_output, cache_read=args.price_cache_read
     )
 
 
@@ -362,6 +477,30 @@ def _progress(event: Event) -> None:
     step = f"{event.step:>3}" if event.step is not None else "  -"
     stream = f"s{event.stream}" if event.stream is not None else "  "
     print(f"  [{step} {stream}] {mark} {event.message}", file=sys.stderr, flush=True)
+
+
+def load_dotenv(path: Path) -> list[str]:
+    """Load ``KEY=value`` lines from ``path`` into the environment, if the file exists.
+
+    Only the command line does this, for convenience with API keys; variables
+    already set in the environment win. Returns the names that were set.
+    """
+    if not path.is_file():
+        return []
+    loaded: list[str] = []
+    # utf-8-sig: editors on Windows may prepend a byte-order mark to the file
+    for raw in path.read_text(encoding="utf-8-sig").splitlines():
+        line = raw.strip()
+        if not line or line.startswith("#") or "=" not in line:
+            continue
+        key, _, value = line.removeprefix("export ").partition("=")
+        key, value = key.strip(), value.strip()
+        if len(value) >= 2 and value[0] == value[-1] and value[0] in "\"'":
+            value = value[1:-1]
+        if key and value and key not in os.environ:
+            os.environ[key] = value
+            loaded.append(key)
+    return loaded
 
 
 def _utf8_console() -> None:

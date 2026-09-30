@@ -7,9 +7,14 @@ from typing import Any
 import pytest
 from pydantic import BaseModel, Field
 
-from widethink.errors import RefusalError, StructuredOutputError, TruncatedOutputError
-from widethink.llm import LLMRequest, ScriptedLLM, Usage, generate_structured
-from widethink.llm.jsonschema import extract_json, strict_json_schema
+from widethink.errors import (
+    RefusalError,
+    StructuredOutputError,
+    TransientLLMError,
+    TruncatedOutputError,
+)
+from widethink.llm import LLMRequest, ScriptedLLM, Usage, generate_structured, generate_text
+from widethink.llm.jsonschema import extract_json, schema_example, strict_json_schema
 from widethink.schemas import ExpansionOut, SynthesisOut
 
 
@@ -148,3 +153,42 @@ async def test_refusals_are_not_retried() -> None:
     with pytest.raises(RefusalError):
         await generate_structured(llm, REQUEST, Answer, retries=3)
     assert len(llm.requests) == 1
+
+
+async def test_transient_failures_are_retried_as_they_were() -> None:
+    busy = TransientLLMError("busy", usage=Usage(input_tokens=5), model="m")
+    llm = ScriptedLLM(replies=[busy, '{"value": 2}'])
+    seen, hook = attempts()
+    parsed, _ = await generate_structured(llm, REQUEST, Answer, on_attempt=hook)
+    assert parsed.value == 2
+    assert llm.requests[0] == llm.requests[1]  # same request, nothing to correct
+    assert [ok for _, _, ok in seen] == [False, True]
+    with pytest.raises(TransientLLMError):
+        await generate_structured(ScriptedLLM(replies=[busy, busy]), REQUEST, Answer)
+
+
+async def test_generate_text_retries_truncation_and_transient_failures() -> None:
+    llm = ScriptedLLM(replies=[TruncatedOutputError("cut"), "full answer"])
+    seen, hook = attempts()
+    response = await generate_text(llm, REQUEST, on_attempt=hook)
+    assert response.text == "full answer"
+    assert llm.requests[0].json_schema is None
+    assert [r.max_tokens for r in llm.requests] == [100, 200]
+    assert [ok for _, _, ok in seen] == [False, True]
+    llm = ScriptedLLM(replies=[TransientLLMError("busy"), "ok"])
+    assert (await generate_text(llm, REQUEST)).text == "ok"
+    with pytest.raises(TruncatedOutputError):
+        await generate_text(ScriptedLLM(replies=[TruncatedOutputError("a")] * 2), REQUEST)
+
+
+def test_schema_example_has_the_shape_of_the_schema() -> None:
+    example = schema_example(strict_json_schema(ExpansionOut))
+    assert set(example) == set(ExpansionOut.model_fields)
+    assert example["resolution"] == "supported"  # first enum value
+    assert example["surprise"] == {"level": 0.0, "about": "..."}
+    assert set(example["next"][0]) == {"idea", "detail", "kind", "link", "value", "grounding"}
+    assert example["next"][0]["grounding"] == ["..."]
+    assert schema_example({"anyOf": [{"type": "null"}, {"type": "integer"}]}) == 0
+    assert schema_example({"type": ["null", "boolean"]}) is False
+    assert schema_example({"const": "x"}) == "x"
+    assert schema_example({}) is None

@@ -6,13 +6,16 @@
   final call that picks the one fitting this user best.
 * ``widethink`` - the harness.
 
-Reasoning modes are covered by passing an effort to ``direct``; Tree of
-Thoughts and parallel-reasoning baselines are on the roadmap.
+Baselines answer in plain text, as a user would see it; only the harness and
+the best-of-N pick use structured output. Reasoning modes are covered by
+passing an effort (and a thinking-enabled model) to ``direct``; Tree of Thoughts
+and parallel-reasoning baselines are on the roadmap.
 """
 
 from __future__ import annotations
 
 from dataclasses import dataclass, field
+from pathlib import Path
 from typing import Protocol
 
 from pydantic import BaseModel, Field
@@ -24,7 +27,7 @@ from widethink.context import Context
 from widethink.embeddings.base import Embedder
 from widethink.engine import Thinker
 from widethink.llm.base import LLM, LLMRequest, Usage
-from widethink.llm.structured import AttemptHook, generate_structured
+from widethink.llm.structured import AttemptHook, generate_structured, generate_text
 from widethink.prompts import render_context
 from widethink.result import ThinkResult
 
@@ -64,24 +67,29 @@ def task_prompt(task: BenchTask) -> str:
     return f"TASK:\n{task.task}\n\nCONTEXT:\n{context}"
 
 
-class _Plain(BaseModel):
-    answer: str = Field(description="The complete answer.")
-
-
 class _Choice(BaseModel):
     best: int = Field(description="Number of the best candidate.")
     reason: str
 
 
 class DirectSolver:
-    """One call, no widening; ``effort`` turns it into a reasoning-mode baseline."""
+    """One call, no widening; ``effort`` turns it into a reasoning-mode baseline.
+
+    Reasoning uses output tokens for thinking, so with an effort the default
+    output limit is larger.
+    """
 
     def __init__(
-        self, llm: LLM, *, effort: Effort | None = None, max_tokens: int = 8000, name: str = ""
+        self,
+        llm: LLM,
+        *,
+        effort: Effort | None = None,
+        max_tokens: int | None = None,
+        name: str = "",
     ) -> None:
         self.llm = llm
         self.effort = effort
-        self.max_tokens = max_tokens
+        self.max_tokens = max_tokens or (8000 if effort is None else 32_000)
         self._name = name or ("direct" if effort is None else f"direct-{effort}")
         self.system = DIRECT_SYSTEM
 
@@ -173,7 +181,12 @@ class BestOfNSolver:
 
 
 class WideThinkSolver:
-    """The harness itself; the answer includes its deviations and questions."""
+    """The harness itself; the answer includes its deviations and questions.
+
+    With ``save_dir``, every run's full result (the thought tree included) is
+    saved as ``<task>__<solver>__seed<seed>.json`` for later inspection with
+    ``widethink render``.
+    """
 
     def __init__(
         self,
@@ -182,11 +195,13 @@ class WideThinkSolver:
         embedder: Embedder | None = None,
         config: ThinkConfig | None = None,
         name: str = "widethink",
+        save_dir: str | Path | None = None,
     ) -> None:
         self.llm = llm
         self.embedder = embedder
         self.config = config
         self._name = name
+        self.save_dir = None if save_dir is None else Path(save_dir)
 
     @property
     def name(self) -> str:
@@ -197,11 +212,14 @@ class WideThinkSolver:
         result = await thinker.athink(
             task.task, Context.of(*task.context), budget=budget, seed=seed
         )
-        return SolverOutput(
-            answer=format_result(result),
-            usage=result.usage,
-            extra={"thoughts": result.stats.get("thoughts", 0), "stop": result.meta.stop_reason},
-        )
+        extra: dict[str, object] = {
+            "thoughts": result.stats.get("thoughts", 0),
+            "stop": result.meta.stop_reason,
+        }
+        if self.save_dir is not None:
+            path = result.save(self.save_dir / f"{task.id}__{self.name}__seed{seed}.json")
+            extra["tree"] = path.as_posix()
+        return SolverOutput(answer=format_result(result), usage=result.usage, extra=extra)
 
 
 def format_result(result: ThinkResult) -> str:
@@ -239,8 +257,8 @@ async def _answer(
     request = LLMRequest.single(
         system, prompt, max_tokens=max_tokens, effort=effort, purpose=purpose, cache_system=False
     )
-    out, _ = await generate_structured(llm, request, _Plain, on_attempt=_record(ledger, purpose))
-    return out.answer
+    response = await generate_text(llm, request, on_attempt=_record(ledger, purpose))
+    return response.text
 
 
 def _record(ledger: Ledger, purpose: str) -> AttemptHook:

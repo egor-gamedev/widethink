@@ -42,10 +42,11 @@ class RequirementVerdict(BaseModel):
     model_config = ConfigDict(frozen=True)
 
     requirement_id: str
-    noticed: bool
-    addressed: bool
-    asked: bool
-    rationale: str = Field(description="One or two sentences citing the answer.")
+    # A field the judge forgets to return counts as "no" instead of failing the grading.
+    noticed: bool = False
+    addressed: bool = False
+    asked: bool = False
+    rationale: str = Field(default="", description="One or two sentences citing the answer.")
 
 
 class JudgeResult(BaseModel):

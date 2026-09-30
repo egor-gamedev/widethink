@@ -10,7 +10,7 @@ from typing import Any
 import pytest
 
 from conftest import FakeMind
-from widethink import Budget, ThinkConfig
+from widethink import Budget, Pricing, ThinkConfig
 from widethink.bench import (
     CANARY,
     BenchTask,
@@ -25,6 +25,7 @@ from widethink.bench import (
     SolverOutput,
     WideThinkSolver,
     bootstrap_ci,
+    load_records,
     load_tasks,
     run_benchmark,
     summarize,
@@ -85,7 +86,7 @@ def answer_responder(text: str) -> Any:
     def respond(request: LLMRequest) -> Any:
         if request.purpose == "judge":
             return judge_responder(request)
-        return {"answer": text}
+        return text
 
     return respond
 
@@ -135,7 +136,7 @@ def test_json_tasks_and_duplicate_ids(tmp_path: Path) -> None:
 
 
 async def test_direct_broad_and_effort_solvers() -> None:
-    llm = ScriptedLLM(lambda request: {"answer": request.system[-30:]})
+    llm = ScriptedLLM(lambda request: request.system[-30:])
     task = make_task()
     direct = await DirectSolver(llm).solve(task, Budget(), seed=0)
     broad = await BroadPromptSolver(llm).solve(task, Budget(), seed=0)
@@ -155,7 +156,7 @@ async def test_best_of_n_samples_within_budget_then_selects() -> None:
     def respond(request: LLMRequest) -> Any:
         if request.purpose == "select":
             return {"best": 2, "reason": "fits this customer"}
-        return {"answer": f"candidate {next(samples)}"}
+        return f"candidate {next(samples)}"
 
     llm = ScriptedLLM(respond)
     output = await BestOfNSolver(llm, max_n=3).solve(make_task(), Budget(), seed=0)
@@ -249,7 +250,7 @@ async def test_run_benchmark_resumes_and_records_failures(tmp_path: Path) -> Non
 
 
 async def test_judge_failure_is_recorded(tmp_path: Path) -> None:
-    solver_llm = ScriptedLLM(lambda request: {"answer": "x"})
+    solver_llm = ScriptedLLM(lambda request: "x")
     judge_llm = ScriptedLLM(lambda request: "not json")
     [record] = await run_benchmark(
         [make_task()], [DirectSolver(solver_llm)], judge=LLMJudge(judge_llm), budget=Budget()
@@ -310,7 +311,7 @@ def test_summary_metrics() -> None:
     assert by_name["direct"].control_kept == 1.0
     table = to_markdown(list(by_name.values()))
     assert table.splitlines()[0].startswith("| solver |")
-    assert "| wide | 3 | 75% (" in table
+    assert "| wide | 3 / 3 | 0 | 75% (" in table
 
 
 def test_bootstrap_interval() -> None:
@@ -326,3 +327,84 @@ def test_records_serialize_round_trip(tmp_path: Path) -> None:
     item = record("wide", control=False, flags=[(True, False, False)])
     line = item.model_dump_json()
     assert RunRecord.model_validate(json.loads(line)) == item
+
+
+class FlakySolver:
+    """Fails with a non-widethink exception first, then answers."""
+
+    name = "flaky"
+
+    def __init__(self) -> None:
+        self.calls = 0
+
+    async def solve(self, task: BenchTask, budget: Budget, seed: int) -> SolverOutput:
+        self.calls += 1
+        if self.calls == 1:
+            raise ConnectionError("network down")
+        return SolverOutput(answer="per customer", usage=record("x", control=False, flags=[]).usage)  # type: ignore[arg-type]
+
+
+async def test_failed_jobs_are_recorded_and_rerun_on_resume(tmp_path: Path) -> None:
+    out = tmp_path / "results.jsonl"
+    judge = LLMJudge(ScriptedLLM(judge_responder))
+    solver = FlakySolver()
+    [first] = await run_benchmark([make_task()], [solver], judge=judge, budget=Budget(), out=out)
+    assert first.error == "solver: ConnectionError: network down"
+
+    [second] = await run_benchmark([make_task()], [solver], judge=judge, budget=Budget(), out=out)
+    assert second.error is None
+    assert solver.calls == 2
+    assert len(out.read_text(encoding="utf-8").splitlines()) == 2  # both attempts kept on disk
+    [latest] = load_records(out)  # ...but the last one wins
+    assert latest.error is None
+    assert latest.judged is not None
+
+
+def test_report_prices_recorded_usage() -> None:
+    runs = [record("wide", control=False, flags=[(True, True, False)], tokens=1_000_000)]
+    [summary] = summarize(runs, pricing=Pricing(input=1.0, output=10.0), resamples=10)
+    assert summary.mean_cost_usd == pytest.approx((999_990 * 1.0 + 10 * 10.0) / 1_000_000)
+
+
+class BrokeError(Exception):
+    """Mimics an SDK error for "402 Insufficient funds"."""
+
+    status_code = 402
+
+
+class NoMoneySolver:
+    name = "no-money"
+
+    def __init__(self) -> None:
+        self.calls = 0
+
+    async def solve(self, task: BenchTask, budget: Budget, seed: int) -> SolverOutput:
+        self.calls += 1
+        raise ExceptionGroup("task group", [BrokeError("Insufficient funds")])
+
+
+async def test_a_fatal_provider_error_stops_the_run(tmp_path: Path) -> None:
+    from widethink.bench.runner import BenchmarkAbortedError
+
+    solver = NoMoneySolver()
+    out = tmp_path / "results.jsonl"
+    tasks = [make_task(), make_task(control=True)]
+    with pytest.raises(BenchmarkAbortedError, match="Insufficient funds") as caught:
+        await run_benchmark(
+            tasks, [solver], judge=LLMJudge(ScriptedLLM(judge_responder)), budget=Budget(),
+            repeats=5, concurrency=1, out=out,
+        )  # fmt: skip
+    assert solver.calls == 1  # nothing more is spent after the first refusal
+    assert "BrokeError: Insufficient funds" in str(caught.value)  # the group is unwrapped
+    assert load_records(out)[0].error == "solver: BrokeError: Insufficient funds"
+
+
+def test_ungraded_runs_are_not_reported_as_zero() -> None:
+    failed = RunRecord(
+        task_id="t", solver="wide", repeat=0, control=False, budget=Budget(), error="judge: x"
+    )
+    [summary] = summarize([failed], resamples=10)
+    assert summary.graded == 0
+    assert summary.noticed is None
+    assert summary.noticed_ci is None
+    assert "| wide | 0 / 1 | 1 | - | - | - | - | - |" in to_markdown([summary])

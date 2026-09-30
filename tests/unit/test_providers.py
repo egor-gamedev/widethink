@@ -10,13 +10,16 @@ from typing import Any
 import pytest
 
 from widethink.errors import (
+    ConfigurationError,
     RefusalError,
     ReplayMismatchError,
     StructuredOutputError,
+    TransientLLMError,
     TruncatedOutputError,
 )
 from widethink.llm import (
     AnthropicLLM,
+    DeepSeekLLM,
     LLMRequest,
     OpenAICompatibleLLM,
     RecordingLLM,
@@ -27,6 +30,7 @@ from widethink.llm import (
     request_key,
 )
 from widethink.llm.anthropic import FALLBACK_BETA
+from widethink.llm.deepseek import DEEPSEEK_BASE_URL, KEY_VARIABLE
 
 SCHEMA = {"type": "object", "properties": {"a": {"type": "integer"}}}
 
@@ -225,6 +229,79 @@ class TestOpenAICompatible:
             request(json_schema=SCHEMA)
         )
         assert response.data is None
+
+    async def test_transient_finishes_and_content_filter(self) -> None:
+        for finish in ("insufficient_system_resource", "aborted"):
+            client, _ = openai_client(completion(finish=finish))
+            with pytest.raises(TransientLLMError, match=finish) as caught:
+                await OpenAICompatibleLLM("m", client=client).generate(request())
+            assert caught.value.usage is not None
+        client, _ = openai_client(completion(finish="content_filter"))
+        with pytest.raises(RefusalError, match="content filter"):
+            await OpenAICompatibleLLM("m", client=client).generate(request())
+
+    async def test_deepseek_style_cache_hits_are_counted(self) -> None:
+        reply = completion()
+        reply.usage = SimpleNamespace(
+            prompt_tokens=1000,
+            completion_tokens=10,
+            prompt_tokens_details=SimpleNamespace(prompt_cache_hit_tokens=700),
+            completion_tokens_details=None,
+        )
+        client, _ = openai_client(reply)
+        response = await OpenAICompatibleLLM("m", client=client).generate(request())
+        assert response.usage.cache_read_tokens == 700
+        reply.usage = SimpleNamespace(
+            prompt_tokens=5, completion_tokens=1, prompt_cache_hit_tokens=3
+        )
+        response = await OpenAICompatibleLLM("m", client=client).generate(request())
+        assert response.usage.cache_read_tokens == 3
+
+    def test_extra_body_is_sent(self) -> None:
+        llm = OpenAICompatibleLLM("m", client=object(), extra_body={"top_k": 5})
+        assert llm.build_params(request())["extra_body"] == {"top_k": 5}
+
+
+# ----------------------------------------------------------------------------- DeepSeek
+
+
+class TestDeepSeek:
+    def test_defaults_fit_the_harness(self) -> None:
+        llm = DeepSeekLLM(client=object())
+        params = llm.build_params(request(json_schema=SCHEMA))
+        assert llm.name == "deepseek:deepseek-flash"
+        assert params["model"] == "deepseek-flash"
+        assert params["max_tokens"] == 500
+        assert "max_completion_tokens" not in params
+        assert params["response_format"] == {"type": "json_object"}
+        assert params["extra_body"] == {"thinking": {"type": "disabled"}}
+        system = params["messages"][0]["content"]
+        assert "json" in system  # DeepSeek's JSON mode requires the word...
+        assert json.dumps(SCHEMA) in system
+        assert '{"a": 0}' in system  # ...and an example of the format
+        assert llm.base_url == DEEPSEEK_BASE_URL
+
+    def test_thinking_mode_maps_the_effort(self) -> None:
+        llm = DeepSeekLLM("deepseek-v4-pro", client=object(), thinking=True)
+        assert llm.name == "deepseek:deepseek-v4-pro+thinking"
+        thinking = llm.build_params(request(effort="medium"))["extra_body"]["thinking"]
+        assert thinking == {"type": "enabled", "reasoning_effort": "high"}
+        plain = llm.build_params(request())["extra_body"]["thinking"]
+        assert plain == {"type": "enabled"}
+
+    def test_key_comes_from_the_environment(self, monkeypatch: pytest.MonkeyPatch) -> None:
+        monkeypatch.delenv(KEY_VARIABLE, raising=False)
+        with pytest.raises(ConfigurationError, match=KEY_VARIABLE):
+            DeepSeekLLM()
+        monkeypatch.setenv(KEY_VARIABLE, "test-key")
+        llm = DeepSeekLLM()
+        assert str(llm._client.base_url).startswith(DEEPSEEK_BASE_URL)
+
+    async def test_generate_reads_json_mode_replies(self) -> None:
+        client, recorder = openai_client(completion('{"a": 3}'))
+        response = await DeepSeekLLM(client=client).generate(request(json_schema=SCHEMA))
+        assert response.data == {"a": 3}
+        assert recorder.calls[0]["extra_body"] == {"thinking": {"type": "disabled"}}
 
 
 # ----------------------------------------------------------------------------- scripted

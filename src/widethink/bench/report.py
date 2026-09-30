@@ -10,6 +10,7 @@ from statistics import mean
 from pydantic import BaseModel, ConfigDict
 
 from widethink.bench.runner import RunRecord
+from widethink.budget import Pricing
 
 
 class SolverSummary(BaseModel):
@@ -19,14 +20,16 @@ class SolverSummary(BaseModel):
 
     solver: str
     runs: int
+    graded: int
+    """Runs the judge actually graded; metrics are over these only."""
     errors: int
-    noticed: float
-    """Share of hidden requirements the answer noticed or asked about."""
-    noticed_ci: tuple[float, float]
-    addressed: float
+    noticed: float | None
+    """Share of hidden requirements the answer noticed or asked about (None: nothing graded)."""
+    noticed_ci: tuple[float, float] | None
+    addressed: float | None
     """Share of hidden requirements the solution actually handles."""
-    asked: float
-    unsupported_per_task: float
+    asked: float | None
+    unsupported_per_task: float | None
     """Invented requirements per task (false alarms)."""
     control_kept: float | None
     """Share of control tasks answered with the standard solution and no inventions."""
@@ -36,15 +39,25 @@ class SolverSummary(BaseModel):
 
 
 def summarize(
-    records: Sequence[RunRecord], *, resamples: int = 2000, seed: int = 0
+    records: Sequence[RunRecord],
+    *,
+    pricing: Pricing | None = None,
+    resamples: int = 2000,
+    seed: int = 0,
 ) -> list[SolverSummary]:
+    """Per-solver metrics. With ``pricing``, costs are computed from the recorded usage."""
     by_solver: dict[str, list[RunRecord]] = defaultdict(list)
     for record in records:
         by_solver[record.solver].append(record)
-    return [_summarize(solver, runs, resamples, seed) for solver, runs in sorted(by_solver.items())]
+    return [
+        _summarize(solver, runs, pricing, resamples, seed)
+        for solver, runs in sorted(by_solver.items())
+    ]
 
 
-def _summarize(solver: str, runs: list[RunRecord], resamples: int, seed: int) -> SolverSummary:
+def _summarize(
+    solver: str, runs: list[RunRecord], pricing: Pricing | None, resamples: int, seed: int
+) -> SolverSummary:
     graded = [r for r in runs if r.judged is not None]
     hidden = [r for r in graded if not r.control]
     controls = [r for r in graded if r.control]
@@ -72,22 +85,30 @@ def _summarize(solver: str, runs: list[RunRecord], resamples: int, seed: int) ->
             for r in controls
         )
     usages = [r.usage for r in runs if r.usage is not None]
-    costs = [u.cost_usd for u in usages if u.cost_usd is not None]
+    if pricing is not None:
+        costs = [pricing.cost(u.total) for u in usages]
+    else:
+        costs = [u.cost_usd for u in usages if u.cost_usd is not None]
     return SolverSummary(
         solver=solver,
         runs=len(runs),
+        graded=len(graded),
         errors=sum(1 for r in runs if r.error),
-        noticed=_mean(noticed),
-        noticed_ci=bootstrap_ci(per_task_noticed, resamples=resamples, seed=seed),
-        addressed=_mean(addressed),
-        asked=_mean(asked),
-        unsupported_per_task=_mean(
+        noticed=_rate(noticed),
+        noticed_ci=(
+            bootstrap_ci(per_task_noticed, resamples=resamples, seed=seed)
+            if per_task_noticed
+            else None
+        ),
+        addressed=_rate(addressed),
+        asked=_rate(asked),
+        unsupported_per_task=_rate(
             [float(len(r.judged.result.unsupported_claims)) for r in graded if r.judged]
         ),
         control_kept=control_kept,
         mean_tokens=_mean([float(u.total.total_tokens) for u in usages]),
         mean_output_tokens=_mean([float(u.total.output_tokens) for u in usages]),
-        mean_cost_usd=_mean(costs) if costs else None,
+        mean_cost_usd=round(mean(costs), 6) if costs else None,
     )
 
 
@@ -106,21 +127,32 @@ def bootstrap_ci(
 
 def to_markdown(summaries: Sequence[SolverSummary]) -> str:
     header = (
-        "| solver | runs | noticed (95% CI) | addressed | asked | inventions/task "
-        "| control kept | tokens | output tokens | cost |\n"
-        "|---|---:|---|---:|---:|---:|---:|---:|---:|---:|"
+        "| solver | graded / runs | errors | noticed (95% CI) | addressed | asked "
+        "| inventions/task | control kept | tokens | output tokens | cost |\n"
+        "|---|---:|---:|---|---:|---:|---:|---:|---:|---:|---:|"
     )
     rows = []
     for s in summaries:
-        control = "-" if s.control_kept is None else f"{s.control_kept:.0%}"
+        noticed = _pct(s.noticed)
+        if s.noticed_ci is not None:
+            noticed += f" ({s.noticed_ci[0]:.0%}-{s.noticed_ci[1]:.0%})"
+        inventions = "-" if s.unsupported_per_task is None else f"{s.unsupported_per_task:.2f}"
         cost = "-" if s.mean_cost_usd is None else f"${s.mean_cost_usd:.4f}"
         rows.append(
-            f"| {s.solver} | {s.runs} "
-            f"| {s.noticed:.0%} ({s.noticed_ci[0]:.0%}-{s.noticed_ci[1]:.0%})"
-            f" | {s.addressed:.0%} | {s.asked:.0%} | {s.unsupported_per_task:.2f} | {control}"
+            f"| {s.solver} | {s.graded} / {s.runs} | {s.errors} | {noticed}"
+            f" | {_pct(s.addressed)} | {_pct(s.asked)} | {inventions} | {_pct(s.control_kept)}"
             f" | {s.mean_tokens:,.0f} | {s.mean_output_tokens:,.0f} | {cost} |"
         )
     return "\n".join([header, *rows])
+
+
+def _pct(value: float | None) -> str:
+    return "-" if value is None else f"{value:.0%}"
+
+
+def _rate(values: Sequence[float]) -> float | None:
+    """Mean of graded values; None when nothing was graded (not the same as 0%)."""
+    return round(mean(values), 4) if values else None
 
 
 def _mean(values: Sequence[float]) -> float:

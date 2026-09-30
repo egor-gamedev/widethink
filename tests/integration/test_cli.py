@@ -17,6 +17,34 @@ TASKS_DIR = Path(__file__).resolve().parents[2] / "benchmark" / "tasks"
 TASK = "Add JWT authentication to our API"
 
 
+@pytest.fixture(autouse=True)
+def isolated_directory(
+    tmp_path_factory: pytest.TempPathFactory, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """Run every CLI test from an empty directory, so a developer's real .env is never read."""
+    monkeypatch.chdir(tmp_path_factory.mktemp("cwd"))
+
+
+def test_dotenv_loading(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
+    env = tmp_path / ".env"
+    env.write_text(
+        "# comment\n\nWT_A=plain\nexport WT_B='quoted value'\nWT_C=\"double\"\n"
+        "WT_EMPTY=\nnot a line\nWT_KEPT=from-file\n",
+        encoding="utf-8",
+    )
+    for name in ("WT_A", "WT_B", "WT_C", "WT_EMPTY"):
+        monkeypatch.delenv(name, raising=False)
+    monkeypatch.setenv("WT_KEPT", "from-environment")
+    assert cli.load_dotenv(env) == ["WT_A", "WT_B", "WT_C"]
+    assert cli.os.environ["WT_B"] == "quoted value"
+    assert cli.os.environ["WT_C"] == "double"
+    assert cli.os.environ["WT_KEPT"] == "from-environment"  # the environment wins
+    assert "WT_EMPTY" not in cli.os.environ
+    assert cli.load_dotenv(tmp_path / "missing.env") == []
+    for name in ("WT_A", "WT_B", "WT_C"):
+        monkeypatch.delenv(name)
+
+
 @pytest.fixture
 def project(tmp_path: Path) -> Path:
     root = tmp_path / "project"
@@ -33,13 +61,21 @@ def fake_models(monkeypatch: pytest.MonkeyPatch) -> list[ScriptedLLM]:
 
     def respond(request: LLMRequest) -> Any:
         if request.purpose in ("answer", "sample"):
-            return {"answer": "per-customer cache keys"}
+            return "per-customer cache keys"
         if request.purpose == "judge":
             return {"verdicts": [], "unsupported_claims": [], "kept_standard": True}
         return mind(request)
 
-    def make(provider: str, model: str | None, base_url: str | None, structured: str | None) -> Any:
-        llm = ScriptedLLM(respond, name=f"fake-{provider}")
+    def make(
+        provider: str,
+        model: str | None,
+        base_url: str | None,
+        structured: str | None,
+        *,
+        reasoning: bool = False,
+    ) -> Any:
+        suffix = "+thinking" if reasoning else ""
+        llm = ScriptedLLM(respond, name=f"fake-{provider}:{model}{suffix}")
         made.append(llm)
         return llm
 
@@ -120,26 +156,43 @@ def test_bench_validate(capsys: pytest.CaptureFixture[str]) -> None:
     assert "control" in output
 
 
-def test_bench_run_and_report(
+def test_bench_run_report_and_show(
     fake_models: list[ScriptedLLM], tmp_path: Path, capsys: pytest.CaptureFixture[str]
 ) -> None:
     results = tmp_path / "results.jsonl"
+    trees = tmp_path / "trees"
     code = cli.main(
         ["bench", "run", "--tasks", str(TASKS_DIR), "--solver", "direct", "--solver", "broad",
-         "--budget", "50000", "--judge-provider", "openai", "--judge-model", "judge",
-         "--out", str(results), "--concurrency", "2"]
+         "--solver", "direct-high", "--solver", "widethink", "--provider", "deepseek",
+         "--judge-provider", "deepseek", "--budget", "200000", "--out", str(results),
+         "--save-trees", str(trees), "--concurrency", "2",
+         "--price-input", "0.3", "--price-output", "1.2"]
     )  # fmt: skip
     assert code == 0
     table = capsys.readouterr().out
-    assert "| broad |" in table
-    assert "| direct |" in table
-    assert [llm.name for llm in fake_models] == ["fake-anthropic", "fake-openai"]
-    lines = results.read_text(encoding="utf-8").splitlines()
-    assert len(lines) == 2 * len(list(TASKS_DIR.glob("*.yaml")))
+    for solver in ("broad", "direct", "direct-high", "widethink"):
+        assert f"| {solver} |" in table
+    assert "$" in table  # cost column filled from the given prices
+    assert sorted(llm.name for llm in fake_models) == [
+        "fake-deepseek:None",
+        "fake-deepseek:None+thinking",  # the reasoning baseline gets a thinking client
+        "fake-deepseek:deepseek-v4-pro",  # the judge defaults to the stronger model
+    ]
+    tasks = len(list(TASKS_DIR.glob("*.yaml")))
+    assert len(results.read_text(encoding="utf-8").splitlines()) == 4 * tasks
+    assert len(list(trees.glob("*__widethink__seed0.json"))) == tasks
 
     assert cli.main(["bench", "report", str(results), "--format", "json"]) == 0
     summaries = json.loads(capsys.readouterr().out)
-    assert {s["solver"] for s in summaries} == {"direct", "broad"}
+    assert {s["solver"] for s in summaries} == {"direct", "broad", "direct-high", "widethink"}
+
+    task = "auth-offline-field-app"
+    assert cli.main(["bench", "show", str(results), "--task", task, "--answers"]) == 0
+    shown = capsys.readouterr().out
+    assert shown.count(f"=== {task} /") == 4
+    assert "tree: widethink render" in shown
+    assert "| per-customer cache keys" in shown
+    assert cli.main(["bench", "show", str(results), "--task", "no-such-task"]) == 1
 
 
 def test_errors_are_reported_not_raised(capsys: pytest.CaptureFixture[str]) -> None:

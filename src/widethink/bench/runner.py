@@ -15,7 +15,15 @@ from widethink.bench.judge import JudgedResult, LLMJudge
 from widethink.bench.solvers import Solver
 from widethink.bench.task import BenchTask
 from widethink.budget import Budget, UsageSummary
-from widethink.errors import LLMError
+from widethink.errors import LLMError, WideThinkError
+
+#: HTTP statuses after which every further call would fail the same way:
+#: bad key, no money, no permission. The run stops instead of burning through jobs.
+FATAL_STATUSES = frozenset({401, 402, 403})
+
+
+class BenchmarkAbortedError(WideThinkError):
+    """The provider refused in a way no retry can fix; finished jobs are kept in the output."""
 
 
 class RunRecord(BaseModel):
@@ -54,23 +62,30 @@ async def run_benchmark(
 ) -> list[RunRecord]:
     """Solve and grade every (task, solver, repeat); append records to ``out`` as they finish.
 
-    Records already present in ``out`` are loaded and skipped, so an interrupted
-    run resumes where it stopped. Failures are recorded, not raised.
+    Successful records already present in ``out`` are skipped, so an interrupted
+    run resumes where it stopped; failed ones are run again. Failures are
+    recorded, not raised.
     """
     path = None if out is None else Path(out)
     done: dict[tuple[str, str, int], RunRecord] = {}
     if path is not None and path.exists():
         for record in load_records(path):
-            done[record.key] = record
+            if record.error is None:
+                done[record.key] = record
     semaphore = asyncio.Semaphore(concurrency)
     lock = asyncio.Lock()
     records: list[RunRecord] = list(done.values())
+    fatal: list[str] = []
 
     async def one(task: BenchTask, solver: Solver, repeat: int) -> None:
         async with semaphore:
-            record = await _solve_and_grade(
+            if fatal:  # the provider already refused for good: do not spend more calls
+                return
+            record, is_fatal = await _solve_and_grade(
                 task, solver, repeat=repeat, judge=judge, budget=budget, seed=seed
             )
+            if is_fatal and not fatal:
+                fatal.append(record.error or "provider refused")
         async with lock:
             records.append(record)
             if path is not None:
@@ -90,6 +105,11 @@ async def run_benchmark(
     async with asyncio.TaskGroup() as group:
         for task, solver, repeat in jobs:
             group.create_task(one(task, solver, repeat))
+    if fatal:
+        raise BenchmarkAbortedError(
+            f"stopped after a fatal provider error ({fatal[0]}); finished jobs are kept"
+            + (f" in {path} - fix the cause and run the same command to resume" if path else "")
+        )
     order = {
         (t.id, s.name, r): i
         for i, (t, s, r) in enumerate(
@@ -101,7 +121,8 @@ async def run_benchmark(
 
 async def _solve_and_grade(
     task: BenchTask, solver: Solver, *, repeat: int, judge: LLMJudge, budget: Budget, seed: int
-) -> RunRecord:
+) -> tuple[RunRecord, bool]:
+    """Returns the record and whether the failure (if any) is fatal for the whole run."""
     started = time.perf_counter()
 
     def record(**fields: Any) -> RunRecord:
@@ -115,19 +136,49 @@ async def _solve_and_grade(
             **fields,
         )
 
+    # Any failure of one job is recorded, never raised: a long benchmark run must
+    # not die because one call failed. Failed records are re-run on resume.
     try:
         output = await solver.solve(task, budget, seed + repeat)
-    except LLMError as error:
-        return record(error=f"solver: {error}")
+    except Exception as error:
+        cause = _root(error)
+        return record(error=f"solver: {_describe(cause)}"), _is_fatal(cause)
     try:
         judged = await judge.grade(task, output.answer)
-    except LLMError as error:
-        return record(
-            answer=output.answer, usage=output.usage, extra=output.extra, error=f"judge: {error}"
+    except Exception as error:
+        cause = _root(error)
+        failed = record(
+            answer=output.answer,
+            usage=output.usage,
+            extra=output.extra,
+            error=f"judge: {_describe(cause)}",
         )
-    return record(answer=output.answer, usage=output.usage, judged=judged, extra=output.extra)
+        return failed, _is_fatal(cause)
+    ok = record(answer=output.answer, usage=output.usage, judged=judged, extra=output.extra)
+    return ok, False
+
+
+def _root(error: BaseException) -> BaseException:
+    """The first real exception inside (nested) exception groups from task groups."""
+    while isinstance(error, BaseExceptionGroup) and error.exceptions:
+        error = error.exceptions[0]
+    return error
+
+
+def _is_fatal(error: BaseException) -> bool:
+    return getattr(error, "status_code", None) in FATAL_STATUSES
+
+
+def _describe(error: BaseException) -> str:
+    return str(error) if isinstance(error, LLMError) else f"{type(error).__name__}: {error}"
 
 
 def load_records(path: str | Path) -> list[RunRecord]:
-    lines = Path(path).read_text(encoding="utf-8").splitlines()
-    return [RunRecord.model_validate(json.loads(line)) for line in lines if line.strip()]
+    """Records of a results file; when a job was re-run, its last record wins."""
+    latest: dict[tuple[str, str, int], RunRecord] = {}
+    for line in Path(path).read_text(encoding="utf-8").splitlines():
+        if line.strip():
+            record = RunRecord.model_validate(json.loads(line))
+            latest.pop(record.key, None)
+            latest[record.key] = record
+    return list(latest.values())

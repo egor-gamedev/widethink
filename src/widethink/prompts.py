@@ -18,7 +18,7 @@ from widethink.config import ReinstatementConfig
 from widethink.context import Context, ContextItem, render_item
 from widethink.tree import ThoughtNode
 
-PROMPTS_VERSION = "2026-09-30.1"
+PROMPTS_VERSION = "2026-09-30.2"
 
 EXPANSION_RULES = """\
 You are one step of a "wide thinking" process driven by a harness. The harness \
@@ -77,6 +77,9 @@ why, citing the ids of the findings.
 why they matter; where the solution depends on an answer, state the default you chose \
 meanwhile.
 - Do not invent requirements the findings do not support.
+- Findings marked "unknown" or "unresolved" are hypotheses, not facts about the \
+user. Never state them as facts and never base a deviation on them alone; if they \
+matter, turn them into questions.
 - Write in the language of the task."""
 
 
@@ -211,6 +214,8 @@ def render_context(items: Sequence[ContextItem], max_chars: int) -> str:
 
 def _finding(node: ThoughtNode) -> str:
     facts: list[str] = [node.kind, node.resolution or "unresolved"]
+    if node.resolution in (None, "unknown"):
+        facts.append("HYPOTHESIS")
     if node.value is not None:
         facts.append(f"value {node.value:+.1f}")
     if node.surprise:

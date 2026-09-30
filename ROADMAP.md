@@ -77,7 +77,7 @@ flowchart LR
   reasoning effort, broad prompt, best-of-N, widethink), LLM judge, resumable
   runner, report with bootstrap intervals; five exemplar tasks.
 - CLI, offline demo, CI on three OSes and four Python versions, strict typing,
-  202 tests at 97% coverage.
+  215 tests at 97% coverage.
 
 **Exit criteria (met):** CI green; offline demo shows every mechanism; a full run
 is reproducible from a recording.
@@ -89,9 +89,11 @@ and we know what a run costs.
 
 **Work**
 
-1. Live smoke runs of the five exemplar tasks on Claude (`claude-opus-5`,
-   `claude-sonnet-5`) and one open model behind vLLM or Ollama. Every call is
-   recorded (`--record`), so any run can be replayed for free.
+1. Live smoke runs of the five exemplar tasks, first on DeepSeek (`deepseek-flash`
+   with the harness, `deepseek-v4-pro` as judge and strong baseline — cheap enough
+   to iterate freely), then on Claude and one open model behind vLLM or Ollama.
+   Every call is recorded (`--record`), so any run can be replayed for free. The
+   procedure is in [docs/experiments.md](docs/experiments.md).
 2. Prompt iteration on a **dev split only**. Prompts are versioned
    (`PROMPTS_VERSION`); nothing is tuned on tasks that will be reported.
 3. Embedder calibration: collect idea pairs from real trees, label them

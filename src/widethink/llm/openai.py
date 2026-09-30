@@ -7,19 +7,29 @@ from __future__ import annotations
 
 import json
 import re
+from collections.abc import Mapping
 from typing import Any, Literal
 
-from widethink.errors import ConfigurationError, RefusalError, TruncatedOutputError
+from widethink.errors import (
+    ConfigurationError,
+    RefusalError,
+    TransientLLMError,
+    TruncatedOutputError,
+)
 from widethink.llm.base import LLMRequest, LLMResponse, Usage
-from widethink.llm.jsonschema import extract_json
+from widethink.llm.jsonschema import extract_json, schema_example
 
 StructuredMode = Literal["json_schema", "json_object", "prompt"]
 
+# The lowercase word "json" and an example are required by some JSON modes (DeepSeek).
 _SCHEMA_INSTRUCTIONS = (
-    "\n\nReply with a single JSON object and nothing else. "
-    "It must follow this JSON schema:\n{schema}"
+    "\n\nOutput format: reply with one json object and nothing else - no prose, no code "
+    "fences. It must follow this JSON schema:\n{schema}\n\n"
+    "Example of the shape (the values are placeholders; write your own):\n{example}"
 )
 _NAME_UNSAFE = re.compile(r"[^A-Za-z0-9_-]")
+#: Finish reasons meaning the server gave up this time (DeepSeek reports these).
+_TRANSIENT = frozenset({"insufficient_system_resource", "aborted"})
 
 
 class OpenAICompatibleLLM:
@@ -37,6 +47,7 @@ class OpenAICompatibleLLM:
             accept only ``max_tokens``.
         send_effort: Forward the effort hint as ``reasoning_effort`` (for
             reasoning models that support it).
+        extra_body: Provider-specific fields added to every request body.
     """
 
     def __init__(
@@ -49,6 +60,7 @@ class OpenAICompatibleLLM:
         structured: StructuredMode = "json_schema",
         max_tokens_param: Literal["max_completion_tokens", "max_tokens"] = "max_completion_tokens",
         send_effort: bool = False,
+        extra_body: Mapping[str, Any] | None = None,
     ) -> None:
         if client is None:
             try:
@@ -65,6 +77,7 @@ class OpenAICompatibleLLM:
         self.structured = structured
         self.max_tokens_param = max_tokens_param
         self.send_effort = send_effort
+        self.extra_body = dict(extra_body or {})
 
     @property
     def name(self) -> str:
@@ -83,9 +96,14 @@ class OpenAICompatibleLLM:
                 usage=usage,
                 model=model,
             )
+        if choice.finish_reason in _TRANSIENT:
+            raise TransientLLMError(
+                f"{model} stopped early ({choice.finish_reason})", usage=usage, model=model
+            )
         refusal = getattr(choice.message, "refusal", None)
-        if refusal:
-            raise RefusalError(f"{model} declined the request: {refusal}", usage=usage, model=model)
+        if refusal or choice.finish_reason == "content_filter":
+            reason = refusal or "content filter"
+            raise RefusalError(f"{model} declined the request: {reason}", usage=usage, model=model)
         text = choice.message.content or ""
         data: Any = None
         if request.json_schema is not None:
@@ -101,8 +119,10 @@ class OpenAICompatibleLLM:
         """Translate a provider-neutral request into ``chat.completions.create`` arguments."""
         system = request.system
         if request.json_schema is not None and self.structured != "json_schema":
-            schema = json.dumps(request.json_schema, ensure_ascii=False)
-            system = system + _SCHEMA_INSTRUCTIONS.format(schema=schema)
+            system = system + _SCHEMA_INSTRUCTIONS.format(
+                schema=json.dumps(request.json_schema, ensure_ascii=False),
+                example=json.dumps(schema_example(request.json_schema), ensure_ascii=False),
+            )
         messages: list[dict[str, str]] = [{"role": "system", "content": system}] if system else []
         messages += [{"role": m.role, "content": m.content} for m in request.messages]
         params: dict[str, Any] = {
@@ -126,18 +146,30 @@ class OpenAICompatibleLLM:
             params["reasoning_effort"] = request.effort
         if request.temperature is not None:
             params["temperature"] = request.temperature
+        if self.extra_body:
+            params["extra_body"] = dict(self.extra_body)
         return params
 
 
 def _usage(raw: Any) -> Usage:
-    """Normalize OpenAI usage: ``prompt_tokens`` already includes cached tokens."""
+    """Normalize OpenAI-style usage: ``prompt_tokens`` already includes cached tokens.
+
+    Cache hits are read from ``prompt_tokens_details.cached_tokens`` (OpenAI) or
+    ``prompt_cache_hit_tokens`` (DeepSeek, nested or at the top level).
+    """
     if raw is None:
         return Usage()
     prompt_details = getattr(raw, "prompt_tokens_details", None)
     completion_details = getattr(raw, "completion_tokens_details", None)
+    cached = (
+        getattr(prompt_details, "cached_tokens", None)
+        or getattr(prompt_details, "prompt_cache_hit_tokens", None)
+        or getattr(raw, "prompt_cache_hit_tokens", None)
+        or 0
+    )
     return Usage(
         input_tokens=int(getattr(raw, "prompt_tokens", 0) or 0),
         output_tokens=int(getattr(raw, "completion_tokens", 0) or 0),
-        cache_read_tokens=int(getattr(prompt_details, "cached_tokens", 0) or 0),
+        cache_read_tokens=int(cached),
         reasoning_tokens=int(getattr(completion_details, "reasoning_tokens", 0) or 0),
     )

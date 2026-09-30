@@ -90,6 +90,14 @@ for q in result.questions:
 print(result.render())  # the thought tree
 ```
 
+With DeepSeek (cheap enough to iterate freely; key in `DEEPSEEK_API_KEY`):
+
+```python
+from widethink.llm import DeepSeekLLM
+
+thinker = Thinker(DeepSeekLLM())  # deepseek-flash, thinking mode off
+```
+
 With GPT or an open model behind an OpenAI-compatible server (vLLM, Ollama):
 
 ```python
@@ -100,13 +108,16 @@ llm = OpenAICompatibleLLM("qwen3-32b", base_url="http://localhost:8000/v1")
 thinker = Thinker(llm, embedder=OpenAIEmbedder(base_url="http://localhost:8000/v1"))
 ```
 
-From the command line:
+From the command line (keys can live in a git-ignored `.env`, see `.env.example`):
 
 ```bash
 widethink think "Add JWT-based authentication to our API" -c ./my-project --budget 60000
-widethink think "..." -c ./my-project --record runs/jwt.recording.jsonl --out runs/jwt.json
+widethink think "..." -c ./my-project --provider deepseek --record runs/jwt.recording.jsonl --out runs/jwt.json
 widethink render runs/jwt.json --format mermaid
 ```
+
+A step-by-step guide to testing on real models — smoke test, reading trees,
+mini-benchmark, cost — is in [docs/experiments.md](docs/experiments.md).
 
 ## What a run looks like
 
@@ -160,7 +171,7 @@ tasks; version 1 (60–100 validated tasks) is Phase 2 of the [roadmap](ROADMAP.
 ## Status
 
 **Alpha, research code.** The architecture, every mechanism, the providers, the
-budget accounting and the benchmark harness are implemented and tested (202
+budget accounting and the benchmark harness are implemented and tested (215
 tests, 97% coverage, strict typing). There are **no results yet**: whether wide
 thinking beats plain models at the same budget is exactly what the
 [roadmap](ROADMAP.md) sets out to measure, with a pre-registered analysis and

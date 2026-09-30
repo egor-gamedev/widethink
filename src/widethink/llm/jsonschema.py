@@ -89,6 +89,31 @@ def _strictify(node: Any, *, name_map: bool = False) -> Any:
     return out
 
 
+def schema_example(schema: dict[str, Any]) -> Any:
+    """A placeholder instance showing the shape a schema expects.
+
+    Providers without schema enforcement (JSON mode, prompt-only) follow the
+    format more reliably when they see an example next to the schema; DeepSeek's
+    documentation asks for one explicitly. Values are placeholders, not advice.
+    """
+    if "const" in schema:
+        return schema["const"]
+    if "enum" in schema:
+        return schema["enum"][0]
+    options = schema.get("anyOf") or schema.get("oneOf")
+    if options:
+        concrete = [o for o in options if o.get("type") != "null"] or options
+        return schema_example(concrete[0])
+    kind = schema.get("type")
+    if isinstance(kind, list):
+        kind = next((k for k in kind if k != "null"), None)
+    if kind == "object":
+        return {key: schema_example(value) for key, value in schema.get("properties", {}).items()}
+    if kind == "array":
+        return [schema_example(schema.get("items", {}))]
+    return {"string": "...", "number": 0.0, "integer": 0, "boolean": False}.get(str(kind))
+
+
 def extract_json(text: str) -> Any:
     """Parse JSON from model output that may be wrapped in prose or code fences.
 
