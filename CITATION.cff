@@ -1,0 +1,23 @@
+cff-version: 1.2.0
+message: "If you use widethink or the Hidden Requirements benchmark, please cite it as below."
+type: software
+title: "widethink: brain-inspired wide thinking for LLMs"
+abstract: >-
+  A harness between the user and a language model that decides what the model
+  thinks about at each step, using the mechanisms of a digital brain's thought
+  stream (lottery selection, satiation, inhibition of return, fading, value pull,
+  capture by surprise, and branches cued by the user's context), together with a
+  benchmark of tasks whose standard solution does not fit the user's context.
+authors:
+  - given-names: Egor
+    alias: egor-gamedev
+repository-code: "https://github.com/egor-gamedev/widethink"
+license: Apache-2.0
+version: 0.1.0.dev0
+keywords:
+  - large language models
+  - reasoning
+  - test-time compute
+  - tree of thoughts
+  - benchmark
+  - hidden requirements

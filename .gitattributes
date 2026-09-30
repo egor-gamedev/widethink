@@ -1,0 +1,8 @@
+# Normalize line endings in the repository; check out with LF everywhere so
+# that hashes of prompts, recordings and benchmark files match across OSes.
+* text=auto eol=lf
+
+*.png binary
+*.jpg binary
+*.gif binary
+*.pdf binary

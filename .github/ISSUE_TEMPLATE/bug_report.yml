@@ -1,0 +1,35 @@
+name: Bug report
+description: Something does not work as documented.
+labels: [bug]
+body:
+  - type: textarea
+    id: what
+    attributes:
+      label: What happened
+      description: What you did, what you expected, and what happened instead.
+    validations:
+      required: true
+  - type: textarea
+    id: reproduce
+    attributes:
+      label: How to reproduce
+      description: The command or a minimal code snippet. A recording made with `--record` (private data removed) lets us replay your run exactly.
+      render: python
+    validations:
+      required: true
+  - type: input
+    id: version
+    attributes:
+      label: widethink version
+      placeholder: "output of `widethink --version`"
+    validations:
+      required: true
+  - type: input
+    id: model
+    attributes:
+      label: Provider and model
+      placeholder: "anthropic / claude-opus-5, or openai-compatible / vLLM + Qwen3-32B"
+  - type: input
+    id: environment
+    attributes:
+      label: OS and Python version
