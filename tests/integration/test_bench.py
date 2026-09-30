@@ -408,3 +408,16 @@ def test_ungraded_runs_are_not_reported_as_zero() -> None:
     assert summary.noticed is None
     assert summary.noticed_ci is None
     assert "| wide | 0 / 1 | 1 | - | - | - | - | - |" in to_markdown([summary])
+
+
+def test_judge_does_not_read_filler() -> None:
+    from widethink.bench.judge import FILLER_KIND, judge_prompt
+
+    task = make_task()
+    noise = {"id": "legacy/x.py", "title": "x", "content": "NOISE" * 100, "kind": FILLER_KIND}
+    padded = BenchTask.model_validate(
+        task.model_dump() | {"context": [*task.model_dump()["context"], noise]}
+    )
+    prompt = judge_prompt(padded, "answer")
+    assert "NOISE" not in prompt
+    assert "prices differ per customer" in prompt

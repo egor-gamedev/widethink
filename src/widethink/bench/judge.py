@@ -17,6 +17,8 @@ from widethink.llm.structured import generate_structured
 from widethink.prompts import render_context
 
 JUDGE_PROMPT_VERSION = "2026-09-30.1"
+#: Context items of this kind are noise added to make tasks long; see benchmark/tools.
+FILLER_KIND = "filler"
 
 JUDGE_SYSTEM = """\
 You grade answers for a benchmark of hidden requirements. A task has a standard \
@@ -110,7 +112,10 @@ class LLMJudge:
 
 
 def judge_prompt(task: BenchTask, answer: str) -> str:
-    context = render_context(task.context, 200_000) if task.context else "(none)"
+    # Padding (kind "filler") only makes the task harder for solvers; the judge needs
+    # the real context, and reading the padding would multiply the cost of grading.
+    real = [item for item in task.context if item.kind != FILLER_KIND]
+    context = render_context(real, 200_000) if real else "(none)"
     if task.hidden_requirements:
         rubric = "\n\n".join(
             f"[{r.id}] {r.description}\n  noticed? {r.noticed}\n  addressed? {r.addressed}"
